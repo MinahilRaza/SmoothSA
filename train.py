@@ -13,6 +13,7 @@ import time
 
 import numpy as np
 import torch as pt
+from torch.utils.tensorboard import SummaryWriter
 import tqdm
 import wandb
 
@@ -197,12 +198,21 @@ def main(args):
             config=json.loads(json.dumps(cfg.__dict__, default=str)),
             reinit=True,
         )
+    tbwriter = None
+    if not args.no_tb:
+        run_name = args.run_name or tb_run_name(cfg_name, args.ckpt_file, seed)
+        tbwriter = SummaryWriter(args.tb_dir / run_name)
+        tbwriter.add_text("config", "```\n" + args.cfg_file.read_text() + "\n```")
+        tbwriter.add_text("args", "```\n" + json.dumps(vars(args), default=str, indent=1) + "\n```")
+        print(f"tensorboard: {args.tb_dir / run_name}")
     for cb in cfg.callback_t + cfg.callback_v:
         if cb.type.__name__ in ["AverageLog", "HandleLog"]:
             cb.log_file = f"{save_path}.txt"
             if args.project:
                 cb.wabrun = wabrun  # comment this to disable wandb
-        elif cb.type.__name__ == "SaveModel":
+            if tbwriter and cb.type.__name__ == "AverageLog":
+                cb.tbwriter = tbwriter
+        elif cb.type.__name__ in ["SaveModel", "SaveValVideo"]:
             cb.save_dir = save_path
     callback_t = build_from_config(cfg.callback_t)
     callback_v = build_from_config(cfg.callback_v)
@@ -232,6 +242,8 @@ def main(args):
         pack.epoch = epoch_count
         pt.cuda.empty_cache()
         train_epoch(pack)
+        if tbwriter:
+            log_schedule(tbwriter, pack)
 
         flag1 = pack.step_count >= (epoch_count_v + 1) * pack.val_interval
         flag2 = pack.step_count >= pack.total_step
@@ -244,6 +256,28 @@ def main(args):
 
     assert pack.step_count == pack.total_step
     [_.after_train(**pack) for _ in pack.callback_t]
+    if tbwriter:
+        tbwriter.close()
+
+
+def tb_run_name(cfg_name, ckpt_file, seed):
+    """eg ``smoothsav_c_masksupmatch_curric_ft-libero/init-smoothsav_c-movi_c-best_seed42_20261015-154000``"""
+    if ckpt_file:
+        ckpts = ckpt_file if isinstance(ckpt_file, (list, tuple)) else [ckpt_file]
+        init = "+".join(f"{Path(_).parent.name}-{Path(_).stem}" for _ in ckpts)
+    else:
+        init = "scratch"
+    return f"{cfg_name}/init-{init}_seed{seed}_{time.strftime('%Y%m%d-%H%M%S')}"
+
+
+def log_schedule(tbwriter, pack):
+    """Scheduled values worth seeing next to the losses: lr, training window length."""
+    step = pack.step_count
+    for i, group in enumerate(pack.optimiz.param_groups):
+        tbwriter.add_scalar(f"schedule/lr{i}", group["lr"], step)
+    size = getattr(getattr(pack.dataset_t.dataset, "transform0", None), "size", None)
+    if size is not None:
+        tbwriter.add_scalar("schedule/window", size, step)
 
 
 def parse_args():
@@ -263,6 +297,14 @@ def parse_args():
         "--data_dir", type=Path, default="/media/GeneralZ/Storage/Static/datasets"
     )
     parser.add_argument("--save_dir", type=Path, default="save")
+    parser.add_argument("--tb_dir", type=Path, default="save/tensorboard")
+    parser.add_argument(
+        "--run_name",
+        type=str,
+        default=None,
+        help="tensorboard run name; default <cfg>/init-<ckpt>_seed<seed>_<time>",
+    )
+    parser.add_argument("--no_tb", action="store_true", help="disable tensorboard")
     parser.add_argument(
         "--ckpt_file",
         type=Path,

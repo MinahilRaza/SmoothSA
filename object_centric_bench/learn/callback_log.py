@@ -23,10 +23,12 @@ class AverageLog(Callback):
         loss_key="loss",
         acc_key="acc",
         wabrun=None,
+        tbwriter=None,
     ):
         super().__init__()
         self.log_file = log_file
         self.wabrun = wabrun
+        self.tbwriter = tbwriter  # ``SummaryWriter``; x-axis is the global step
         self.epoch_key = epoch_key
         self.loss_key = loss_key
         self.acc_key = acc_key
@@ -50,7 +52,7 @@ class AverageLog(Callback):
                 self.state_dict[k] = [v]
 
     @pt.inference_mode()
-    def mean(self):
+    def mean(self, step=None):
         avg_dict = {}
         for k, v in self.state_dict.items():
             metric, valid = list(zip(*v))
@@ -64,8 +66,20 @@ class AverageLog(Callback):
             __class__.save(self.idx, suffix, avg_dict, self.log_file)
         if self.wabrun:
             __class__.save_wab(self.idx, suffix, avg_dict, self.wabrun)
+        if self.tbwriter:
+            step = self.idx if step is None else step
+            __class__.save_tb(step, self.isval, avg_dict, self.tbwriter)
         print(f"{self.idx}{suffix}", avg_dict)
         return avg_dict
+
+    @pt.inference_mode()
+    @staticmethod
+    def save_tb(step, isval, avg_dict, tbwriter):
+        split = "val" if isval else "train"
+        for k, v in avg_dict.items():
+            if np.ndim(v) == 0:
+                tbwriter.add_scalar(f"{split}/{k}", v, step)
+        tbwriter.flush()
 
     @pt.inference_mode()
     @staticmethod
@@ -97,7 +111,7 @@ class AverageLog(Callback):
 
     @pt.inference_mode()
     def after_epoch(self, **pack):
-        self.mean()
+        self.mean(pack.get("step_count"))
         return pack
 
 

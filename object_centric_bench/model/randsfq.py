@@ -38,10 +38,15 @@ class RSFQTransit(nn.Module):
             bias=bias,
         )
 
-    def forward(self, slotzs0, encodes0):
+    def forward(self, slotzs0, encodes0, lookback: int = 1, smask=None):
         """
         slotzs: all past step slots, shape=(b,t=i,n,c)
         encodes: all past and current step frame features, shape=(b,i+1,h*w,c)
+        - smask: slots' mask, shape=(b,n), dtype=bool. True means there is a valid slot.
+        - lookback: eval-only. how many steps back the conditioning slot state
+            is taken from (default 1 = immediately preceding frame, matching
+            the hardcoded behavior this arg replaces). Clamped to what the
+            time-embedding table (size dt) and available history support.
         """
         # slotzs = slotzs[:, -self.dt :, :, :]  # window size <=dt
         # encodes = encodes[:, -(self.dt + 1) :, :, :]  # window size <=dt+1
@@ -68,8 +73,9 @@ class RSFQTransit(nn.Module):
             # print(i, dte.tolist(), te.tolist())
             # import pdb; pdb.set_trace()
         else:
-            slotz = slotzs[:, -1, :, :]
-            dts = pt.ones(b, dtype=pt.int64, device=device)
+            idx = max(1, min(lookback, self.dt - 1, i))
+            slotz = slotzs[:, -idx, :, :]
+            dts = pt.full([b], idx, dtype=pt.int64, device=device)
             encode = encodes[:, -1, :, :]
             dte = pt.zeros(b, dtype=pt.int64, device=device)
         # ### <<<- experiment
@@ -93,5 +99,7 @@ class RSFQTransit(nn.Module):
         tee = self.te(dte)[:, None, :]
         encode = self.proji(encode.detach()) + tee
 
-        query = self.transit(slotz, encode)
+        query = self.transit(
+            slotz, encode, tgt_key_padding_mask=None if smask is None else ~smask
+        )
         return query

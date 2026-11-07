@@ -35,4 +35,10 @@ from .obj_discov_recogn import ObjDiscovRecogn
 from .spot import SPOT, SPOTDistill, AR9TransformerDecoder
 from .dias import ARRandTransformerDecoder
 from .randsfq import RSFQTransit
-from .smoothsa import SmoothSA, NormalSharedPreheated, NormalMlpPreheated, SmoothSAVideo
+from .smoothsa import (
+    SmoothSA,
+    NormalSharedPreheated,
+    NormalMlpPreheated,
+    SmoothSAVideo,
+    SmoothSAVideoStream,
+)

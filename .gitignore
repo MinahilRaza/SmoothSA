@@ -9,6 +9,13 @@ env/
 .vscode/
 .idea/
 
+logs/
+gifs/
+*masks*
+*.pth
+*.gif
+*.mp4
+
 .ipynb_checkpoints/
 
 archive-*

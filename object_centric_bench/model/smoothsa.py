@@ -88,7 +88,18 @@ class SmoothSAVideo(SmoothSA):
         aggregat,  # trunc_bp=false: bad
         transit,
         decode,
+        slot_mask=False,
+        bg_slot=False,
     ):
+        """
+        - slot_mask: one slot per frame-0 bbox only. Padded bboxes (``pad_value``
+            from batch collation) and all-zero bboxes (object not visible at frame
+            0) are masked out of every slot interaction, so each sample behaves as
+            if run alone with its own number of slots. ``smask`` is then returned
+            as an extra last output, and masked slots are zeroed in the outputs.
+        - bg_slot: slot 0 is a background slot and never masked, even if its bbox
+            is the padding value (MOVi convention, see ``LIBERO.bbox_bg``)
+        """
         super().__init__(
             encode_backbone,
             encode_posit_embed,
@@ -98,9 +109,39 @@ class SmoothSAVideo(SmoothSA):
             decode,
         )
         self.transit = transit
+        self.slot_mask = slot_mask
+        self.bg_slot = bg_slot
         __class__.reset_parameters(
             [self.encode_posit_embed, self.encode_project, self.aggregat, self.transit]
         )
+
+    def make_smask(self, condit0):
+        """
+        - condit0: frame-0 bboxes, shape=(b,n,c=4)
+        - smask: shape=(b,n), dtype=bool. True means there is a valid slot.
+        """
+        if not self.slot_mask or condit0 is None:
+            return None
+        pad = (condit0 == self.initializ.pad_value).all(2)
+        zero = (condit0 == 0).all(2)
+        smask = ~pad & ~zero
+        if self.bg_slot:
+            smask[:, 0] = True
+        return smask
+
+    @staticmethod
+    def smask_kwds(smask):
+        return {} if smask is None else dict(smask=smask)
+
+    @staticmethod
+    def finaliz(qinit0, slotz, smask):
+        """Zero masked slots, so losses on slots are not affected by them.
+        Their attention is already zero in ``aggregat`` and ``decode``."""
+        if smask is None:
+            return qinit0, slotz, ()
+        qinit0 = qinit0 * smask[:, :, None]
+        slotz = slotz * smask[:, None, :, None]
+        return qinit0, slotz, (smask,)
 
     def forward(self, input, condit=None):
         """
@@ -122,18 +163,21 @@ class SmoothSAVideo(SmoothSA):
 
         slotz = None
         attenta = []
+        condit0 = None if condit is None else condit[:, 0, :, :]
+        smask = self.make_smask(condit0)
+        kwds = __class__.smask_kwds(smask)
 
         for i in range(t):
             if i == 0:
                 qinit0, query_i = self.initializ(
-                    encode[:, 0, :, :], None if condit is None else condit[:, 0, :, :]
+                    encode[:, 0, :, :], condit0, **kwds
                 )  # (b,n,c)
             else:
-                query_i = self.transit(slotz, encode[:, : i + 1, :, :])
+                query_i = self.transit(slotz, encode[:, : i + 1, :, :], **kwds)
 
             niter = None if i == 0 else 1
             slotz_i, attenta_i = self.aggregat(
-                encode[:, i, :, :], query_i, num_iter=niter
+                encode[:, i, :, :], query_i, smask=smask, num_iter=niter
             )
 
             slotz = (  # (b,i+1,n,c)
@@ -147,11 +191,139 @@ class SmoothSAVideo(SmoothSA):
         attenta = rearrange(attenta, "b t n (h w) -> b t n h w", h=h)
 
         clue = rearrange(feature, "b t c h w -> (b t) (h w) c")
-        recon, attentd = self.decode(clue, slotz.flatten(0, 1))  # (b*t,h*w,c)
+        smaskd = None if smask is None else smask.repeat_interleave(t, 0)  # (b*t,n)
+        recon, attentd = self.decode(clue, slotz.flatten(0, 1), smaskd)  # (b*t,h*w,c)
         recon = rearrange(recon, "(b t) (h w) c -> b t c h w", b=b, h=h)
         attentd = rearrange(attentd, "(b t) n (h w) -> b t n h w", b=b, h=h)
 
-        return feature, qinit0, slotz, attenta, recon, attentd
+        qinit0, slotz, extra = __class__.finaliz(qinit0, slotz, smask)
+        return feature, qinit0, slotz, attenta, recon, attentd, *extra
+
+
+class SmoothSAVideoStream(SmoothSAVideo):
+    """
+    Streaming variant of SmoothSAVideo for online settings (eg VLA) where
+    frames arrive in chunks instead of as a whole video. Slot identities,
+    and the slotz/encode history that ``transit`` conditions on, persist
+    across forward() calls until reset() is called explicitly (eg at an
+    episode boundary).
+    """
+
+    def __init__(self, *args, history_stride: int = 1, **kwargs):
+        """
+        - history_stride: eval-only. how many steps back (in frames) the
+            slot state that ``transit`` conditions on is taken from (default
+            1 = immediately preceding frame). Clamped inside ``transit`` to
+            its time-embedding table size and to available history.
+        """
+        super().__init__(*args, **kwargs)
+        self.history_stride = history_stride
+        self.reset()
+
+    def reset(self):
+        """Drop carried-over state; the next forward() call bootstraps fresh."""
+        self._slotz_hist = None  # (b,i,n,c): past frames' slots
+        self._encode_hist = None  # (b,i,h*w,c): past frames' encodings
+        self._qinit0 = None
+        self._smask = None  # (b,n): fixed at bootstrap from frame-0 bboxes
+
+    def forward(self, input, condit=None, 
+                reset=False):
+        """
+        - input: chunk of frames, shape=(b,t,c,h,w)
+        - condit: condition, shape=(b,t,n,c)
+        - reset: if True, discard carried-over slot state before this chunk
+            (eg episode reset), so frame 0 of this chunk bootstraps fresh
+        """
+        if reset:
+            self.reset()
+
+        b, t, c0, h0, w0 = input.shape
+        input = input.flatten(0, 1)  # (b*t,c,h,w)
+
+        feature = self.encode_backbone(input).detach()  # (b*t,c,h,w)
+        bt, c, h, w = feature.shape
+        encode = feature.permute(0, 2, 3, 1)  # (b*t,h,w,c)
+        encode = self.encode_posit_embed(encode)
+        encode = encode.flatten(1, 2)  # (b*t,h*w,c)
+        encode = self.encode_project(encode)
+
+        feature = rearrange(feature, "(b t) c h w -> b t c h w", b=b)
+        encode = rearrange(encode, "(b t) hw c -> b t hw c", b=b)
+
+        slotz = None  # this chunk's slots, (b,i+1,n,c)
+        attenta = []
+
+        for i in range(t):
+            bootstrap = self._slotz_hist is None and i == 0
+            encode_hist_i = (
+                encode[:, : i + 1, :, :]
+                if self._encode_hist is None
+                else pt.concat([self._encode_hist, encode[:, : i + 1, :, :]], 1)
+            )
+
+            if bootstrap:
+                condit0 = None if condit is None else condit[:, 0, :, :]
+                self._smask = self.make_smask(condit0)
+                qinit0, query_i = self.initializ(
+                    encode[:, 0, :, :], condit0, **__class__.smask_kwds(self._smask)
+                )  # (b,n,c)
+                self._qinit0 = qinit0
+            else:
+                cur_slotz = slotz[:, :i, :, :] if slotz is not None else None
+                if self._slotz_hist is None:
+                    slotz_hist_i = cur_slotz
+                elif cur_slotz is None:
+                    slotz_hist_i = self._slotz_hist
+                else:
+                    slotz_hist_i = pt.concat([self._slotz_hist, cur_slotz], 1)
+                query_i = self.transit(
+                    slotz_hist_i,
+                    encode_hist_i,
+                    lookback=self.history_stride,
+                    **__class__.smask_kwds(self._smask),
+                )
+
+            niter = None if bootstrap else 1
+            slotz_i, attenta_i = self.aggregat(
+                encode[:, i, :, :], query_i, smask=self._smask, num_iter=niter
+            )
+
+            slotz = (  # (b,i+1,n,c)
+                slotz_i[:, None, :, :]
+                if slotz is None
+                else pt.concat([slotz, slotz_i[:, None, :, :]], 1)
+            )
+            attenta.append(attenta_i)  # t*(b,n,h*w)
+
+        # carry state to the next forward() call; detach to truncate backprop
+        # across chunks, and cap to what ``transit`` actually looks at (if it
+        # exposes a window size ``dt``) so history does not grow unbounded
+        encode_hist = (
+            encode if self._encode_hist is None else pt.concat([self._encode_hist, encode], 1)
+        ).detach()
+        slotz_hist = (
+            slotz if self._slotz_hist is None else pt.concat([self._slotz_hist, slotz], 1)
+        ).detach()
+        maxlen = getattr(self.transit, "dt", None)
+        if maxlen is not None:
+            encode_hist = encode_hist[:, -maxlen:, :, :]
+            slotz_hist = slotz_hist[:, -max(maxlen - 1, 1) :, :, :]
+        self._encode_hist = encode_hist
+        self._slotz_hist = slotz_hist
+
+        attenta = pt.stack(attenta, 1)  # (b,t,n,h*w)
+        attenta = rearrange(attenta, "b t n (h w) -> b t n h w", h=h)
+
+        smask = self._smask
+        clue = rearrange(feature, "b t c h w -> (b t) (h w) c")
+        smaskd = None if smask is None else smask.repeat_interleave(t, 0)  # (b*t,n)
+        recon, attentd = self.decode(clue, slotz.flatten(0, 1), smaskd)  # (b*t,h*w,c)
+        recon = rearrange(recon, "(b t) (h w) c -> b t c h w", b=b, h=h)
+        attentd = rearrange(attentd, "(b t) n (h w) -> b t n h w", b=b, h=h)
+
+        qinit0, slotz, extra = __class__.finaliz(self._qinit0, slotz, smask)
+        return feature, qinit0, slotz, attenta, recon, attentd, *extra
 
 
 class NormalSharedPreheated(nn.Module):  #  > normal separate
@@ -389,10 +561,11 @@ class NormalMlpPreheated(nn.Module):
 
         self.register_buffer("detach_flag", pt.tensor(1, dtype=pt.bool))
 
-    def forward(self, encode, condit):
+    def forward(self, encode, condit, smask=None):
         """
         - encode: shape=(b,h*w,c)
         - condit: shape=(b,n,c)
+        - smask: shape=(b,n), dtype=bool. True means there is a valid slot.
         """
         mean = self.mlp(condit)
         randn = pt.randn_like(mean)  # better than not
@@ -402,7 +575,11 @@ class NormalMlpPreheated(nn.Module):
 
         if self.detach_flag:
             encode = encode.detach()
-        qinit = self.qinit(smpl, self.qproj_kv(encode))
+        qinit = self.qinit(
+            smpl,
+            self.qproj_kv(encode),
+            tgt_key_padding_mask=None if smask is None else ~smask,
+        )
 
         if self.training:
             randn2 = pt.randn_like(qinit)  # better than not
