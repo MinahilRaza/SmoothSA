@@ -10,8 +10,9 @@ env/
 .idea/
 
 logs/
+*.log
 gifs/
-*masks*
+sam-masks/
 *.pth
 *.gif
 *.mp4
